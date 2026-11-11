@@ -18,6 +18,15 @@ pub struct Config {
     /// This enables more efficient request processing
     /// when multiple threads are used. Requires Linux 4.5+.
     pub clone_fd: bool,
+    /// How long the event loop keeps looking for the next request before it
+    /// sleeps, while requests follow one another within that time. Waking a
+    /// sleeping thread costs each request several microseconds, which is a
+    /// large part of a short operation; a thread that is still looking takes
+    /// the next request at once. A request that arrives later than this after
+    /// the previous one is waited for asleep, so a slow or idle caller costs
+    /// at most this much processor time after each run of requests. Zero, the
+    /// default, always sleeps. Linux only, and only with one event loop thread.
+    pub spin: std::time::Duration,
 }
 
 /// Mount options accepted by the FUSE filesystem type

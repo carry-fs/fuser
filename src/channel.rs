@@ -27,8 +27,18 @@ impl Channel {
     }
 
     /// Receives data up to the capacity of the given buffer (can block).
-    fn receive(&self, buffer: &mut [u8]) -> nix::Result<usize> {
+    pub(crate) fn receive(&self, buffer: &mut [u8]) -> nix::Result<usize> {
         nix::unistd::read(&self.0, buffer)
+    }
+
+    /// Makes `receive` fail with `EAGAIN` instead of sleeping when no request
+    /// waits, or undoes that. Every user of this device shares the setting.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn set_nonblocking(&self, nonblocking: bool) -> nix::Result<()> {
+        use nix::fcntl::{FcntlArg, OFlag, fcntl};
+        let mut flags = OFlag::from_bits_retain(fcntl(&self.0, FcntlArg::F_GETFL)?);
+        flags.set(OFlag::O_NONBLOCK, nonblocking);
+        fcntl(&self.0, FcntlArg::F_SETFL(flags)).map(drop)
     }
 
     /// Receives data up to the capacity of the given buffer (can block),

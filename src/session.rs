@@ -15,6 +15,8 @@ use std::path::Path;
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::thread::{self};
+use std::time::Duration;
+use std::time::Instant;
 
 use log::debug;
 use log::error;
@@ -293,6 +295,13 @@ impl<FS: Filesystem> Session<FS> {
             return Err(io::Error::other("n_threads"));
         };
 
+        // Threads that share the device would see each other's nonblocking reads.
+        if !config.spin.is_zero() && (!cfg!(target_os = "linux") || n_threads != 1) {
+            return Err(io::Error::other(
+                "spin is only supported on Linux with one thread",
+            ));
+        }
+
         let mut filesystem = Arc::new(filesystem);
 
         let mut channels = Vec::with_capacity(n_threads);
@@ -327,6 +336,7 @@ impl<FS: Filesystem> Session<FS> {
                 negotiated,
                 kernel_capabilities,
                 kernel_abi: proto_version,
+                spin: config.spin,
             };
             threads.push(
                 thread::Builder::new()
@@ -564,18 +574,65 @@ pub(crate) struct SessionEventLoop<FS: Filesystem> {
     pub(crate) negotiated: InitFlags,
     pub(crate) kernel_capabilities: InitFlags,
     pub(crate) kernel_abi: Option<Version>,
+    /// `Config::spin`.
+    pub(crate) spin: Duration,
 }
 
 impl<FS: Filesystem> SessionEventLoop<FS> {
+    /// `Channel::receive_retrying` for `Config::spin`. `polling` says whether
+    /// the device is nonblocking, which it is while each request arrives within
+    /// `spin` of the wait for it starting. The device is then read again and
+    /// again for that long, so the thread is awake when the next request
+    /// comes; once nothing has come, the device blocks again and the thread
+    /// sleeps in the read, as it does without `spin`.
+    #[cfg(target_os = "linux")]
+    fn receive_polling(&self, buf: &mut [u8], polling: &mut bool) -> nix::Result<usize> {
+        use nix::errno::Errno;
+        let start = Instant::now();
+        loop {
+            match self.ch.receive(buf) {
+                Ok(size) => {
+                    let soon = start.elapsed() < self.spin;
+                    if soon != *polling {
+                        self.ch.set_nonblocking(soon)?;
+                        *polling = soon;
+                    }
+                    return Ok(size);
+                }
+                Err(Errno::EAGAIN) if *polling => {
+                    if start.elapsed() < self.spin {
+                        std::hint::spin_loop();
+                    } else {
+                        self.ch.set_nonblocking(false)?;
+                        *polling = false;
+                    }
+                }
+                // As `receive_retrying`.
+                Err(Errno::ENOENT | Errno::EINTR | Errno::EAGAIN) => {}
+                Err(err) => return Err(err),
+            }
+        }
+    }
+
     fn event_loop(&self) -> io::Result<()> {
         // Buffer for receiving requests from the kernel. Only one is allocated and
         // it is reused immediately after dispatching to conserve memory and allocations.
         let mut buf = FuseReadBuf::new();
         let buf = buf.as_mut();
+        #[cfg(target_os = "linux")]
+        let mut polling = false;
         loop {
             // Read the next request from the given channel to kernel driver
             // The kernel driver makes sure that we get exactly one request per read
-            match self.ch.receive_retrying(buf) {
+            #[cfg(target_os = "linux")]
+            let received = if self.spin.is_zero() {
+                self.ch.receive_retrying(buf)
+            } else {
+                self.receive_polling(buf, &mut polling)
+            };
+            #[cfg(not(target_os = "linux"))]
+            let received = self.ch.receive_retrying(buf);
+            match received {
                 Ok(size) => {
                     match RequestWithSender::new(self.ch.sender(), &buf[..size], self.negotiated) {
                         // Dispatch request
@@ -782,6 +839,7 @@ mod test {
             negotiated: InitFlags::empty(),
             kernel_capabilities: InitFlags::empty(),
             kernel_abi: None,
+            spin: Duration::ZERO,
         };
         let runner = thread::spawn(move || event_loop.event_loop());
         let mut request = [0u8; 40];
@@ -808,6 +866,57 @@ mod test {
         assert_eq!(&reply[4..8], &0i32.to_ne_bytes());
         assert_eq!(&reply[8..], &1u64.to_ne_bytes());
         runner.join().unwrap().unwrap();
+    }
+
+    /// While requests follow one another within `spin` the device is polled;
+    /// after one that comes later it blocks again.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn spin_polls_only_while_requests_follow_closely() {
+        use std::os::unix::net::UnixDatagram;
+        use std::time::Duration;
+
+        struct NoFs;
+        impl Filesystem for NoFs {}
+
+        let (client, server) = UnixDatagram::pair().unwrap();
+        let spin = Duration::from_millis(100);
+        let event_loop = SessionEventLoop {
+            thread_name: "spin-test".into(),
+            ch: Channel::new(Arc::new(DevFuse(File::from(OwnedFd::from(server))))),
+            filesystem: Arc::new(FilesystemHolder { fs: Some(NoFs) }),
+            allowed: SessionACL::All,
+            session_owner: geteuid(),
+            negotiated: InitFlags::empty(),
+            kernel_capabilities: InitFlags::empty(),
+            kernel_abi: None,
+            spin,
+        };
+        let nonblocking = || {
+            let flags = nix::fcntl::fcntl(&event_loop.ch, nix::fcntl::FcntlArg::F_GETFL).unwrap();
+            nix::fcntl::OFlag::from_bits_retain(flags).contains(nix::fcntl::OFlag::O_NONBLOCK)
+        };
+        let mut buf = [0u8; 8];
+        let mut polling = false;
+        let mut receive_after = |delay: Duration, polling: &mut bool| {
+            thread::scope(|scope| {
+                scope.spawn(|| {
+                    thread::sleep(delay);
+                    client.send(b"request").unwrap();
+                });
+                event_loop.receive_polling(&mut buf, polling).unwrap()
+            })
+        };
+
+        // A request that is already waiting starts the polling.
+        assert_eq!(receive_after(Duration::ZERO, &mut polling), 7);
+        assert!(polling && nonblocking());
+        // One that follows within `spin` is taken without blocking.
+        assert_eq!(receive_after(spin / 10, &mut polling), 7);
+        assert!(polling && nonblocking());
+        // A late one is waited for in a blocking read, and ends the polling.
+        assert_eq!(receive_after(spin * 3, &mut polling), 7);
+        assert!(!polling && !nonblocking());
     }
 
     /// A filesystem that requests FUSE_ABORT_ERROR during init, so that after an
