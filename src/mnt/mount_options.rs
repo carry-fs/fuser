@@ -306,7 +306,7 @@ pub(crate) fn option_to_flag(option: &MountOption) -> io::Result<nix::mount::MsF
 pub(crate) fn option_to_flag(option: &MountOption) -> io::Result<nix::mount::MntFlags> {
     match option {
         MountOption::Dev => Ok(nix::mount::MntFlags::empty()), // There is no option for dev. It's the absence of NoDev
-        MountOption::NoDev => Ok(nix::mount::MntFlags::MNT_NODEV),
+        MountOption::NoDev => Ok(nix::mount::MntFlags::from_bits_retain(libc::MNT_NODEV)),
         MountOption::Suid => Ok(nix::mount::MntFlags::empty()),
         MountOption::NoSuid => Ok(nix::mount::MntFlags::MNT_NOSUID),
         MountOption::RW => Ok(nix::mount::MntFlags::empty()),

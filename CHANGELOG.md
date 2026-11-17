@@ -1,6 +1,7 @@
 # FUSE for Rust - Changelog
 
 ## Unreleased
+* Fix compilation on NetBSD with nix 0.31.
 * **Breaking:** `Request::uid()` and `Request::gid()` return `Option<u32>`. An idmapped mount
   has no caller ids to report, so there is not always a uid. A filesystem that does not request
   `InitFlags::FUSE_ALLOW_IDMAP` is always given ids and can unwrap
