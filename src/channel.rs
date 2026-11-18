@@ -99,7 +99,18 @@ pub(crate) struct ChannelSender(Arc<DevFuse>);
 
 impl ChannelSender {
     pub(crate) fn send(&self, bufs: &[io::IoSlice<'_>]) -> io::Result<()> {
-        let rc = nix::sys::uio::writev(&self.0, bufs)?;
+        let rc = loop {
+            match nix::sys::uio::writev(&self.0, bufs) {
+                Ok(rc) => break rc,
+                // NetBSD shrinks a local socket's send limit by the bytes its
+                // peer has not read yet, and fails a packet above that limit
+                // with EMSGSIZE instead of blocking. perfused retries too.
+                // poll would report the socket writable at once, so sleep.
+                #[cfg(target_os = "netbsd")]
+                Err(Errno::EMSGSIZE) => std::thread::sleep(std::time::Duration::from_millis(1)),
+                Err(err) => return Err(err.into()),
+            }
+        };
         // writev is atomic, so do not need to check how many bytes are written.
         // libfuse does not do it either
         // https://github.com/libfuse/libfuse/blob/6278995cca991978abd25ebb2c20ebd3fc9e8a13/lib/fuse_lowlevel.c#L267
